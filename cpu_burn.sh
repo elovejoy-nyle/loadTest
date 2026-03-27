@@ -1,34 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
+: <<'COMMENT'
+ cpu_burn.sh - Max out CPU to observe power/thermal behavior on Linux
+               or log nominal temperature without artificial load
 
-# cpu_burn.sh - Max out CPU to observe power/thermal behavior on Linux (Pi/CM modules friendly)
-#
-# Usage:
-#   ./cpu_burn.sh                 # run until Ctrl+C
-#   ./cpu_burn.sh -t 600          # run 10 minutes
-#   ./cpu_burn.sh -w 4            # force 4 workers
-#   ./cpu_burn.sh -l burn.csv     # custom log file
-#
-# Notes:
-# - Will try to set CPU governor to "performance" (needs sudo + supported cpufreq driver).
-# - Prefers stress-ng if available; otherwise uses Python busy loops.
-# - Logs: timestamp,temp_C,freq_khz,load1,throttle_hex (throttle on Pi if vcgencmd present)
+ Usage:
+   ./cpu_burn.sh                 # run stressed until Ctrl+C
+   ./cpu_burn.sh -t 600          # run 10 minutes
+   ./cpu_burn.sh -w 4            # force 4 workers
+   ./cpu_burn.sh -l burn.csv     # custom log file
+   ./cpu_burn.sh -n              # nominal mode: log only, no stress-ng
+   ./cpu_burn.sh -n -t 50400     # log nominally for 14 hours
+
+ Notes:
+ - Will try to set CPU governor to "performance" (needs sudo + supported cpufreq driver).
+ - Prefers stress-ng if available; otherwise uses Python busy loops.
+ - Logs: timestamp,temp_C,freq_khz,load1,throttle_hex
+ - In nominal mode (-n), no synthetic CPU load is applied.
+     
+ Tested:
+ - Raspberry CM5
+ - x86_64 Linux PC
+COMMENT
 
 DURATION=0          # seconds; 0 = until interrupted
 WORKERS=0           # 0 = nproc
 LOGFILE="cpu_burn_$(date +%Y%m%d_%H%M%S).csv"
 SET_GOVERNOR=1
+NOMINAL_ONLY=0
 
 usage() {
   sed -n '1,40p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-while getopts ":t:w:l:gh" opt; do
+while getopts ":t:w:l:gnh" opt; do
   case "$opt" in
     t) DURATION="$OPTARG" ;;
     w) WORKERS="$OPTARG" ;;
     l) LOGFILE="$OPTARG" ;;
     g) SET_GOVERNOR=0 ;;          # don't change governor
+    n) NOMINAL_ONLY=1 ;;          # log only, no synthetic load
     h) usage; exit 0 ;;
     \?) echo "Unknown option: -$OPTARG" >&2; usage; exit 2 ;;
     :)  echo "Option -$OPTARG requires an argument." >&2; usage; exit 2 ;;
@@ -41,7 +52,7 @@ fi
 
 cleanup() {
   echo ""
-  echo "Stopping load..."
+  echo "Stopping..."
   if [[ -n "${LOAD_PID:-}" ]] && kill -0 "$LOAD_PID" 2>/dev/null; then
     kill "$LOAD_PID" 2>/dev/null || true
     wait "$LOAD_PID" 2>/dev/null || true
@@ -56,7 +67,6 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 set_governor_performance() {
-  # Try both per-policy and per-cpu paths
   local changed=0
 
   if command -v cpupower >/dev/null 2>&1; then
@@ -80,9 +90,7 @@ set_governor_performance() {
 }
 
 read_temp_c() {
-  # Prefer vcgencmd on Raspberry Pi, fallback to thermal_zone0
   if command -v vcgencmd >/dev/null 2>&1; then
-    # temp=54.0'C
     vcgencmd measure_temp 2>/dev/null | awk -F'[=\\x27]' '{print $2}' || true
     return
   fi
@@ -94,7 +102,6 @@ read_temp_c() {
 }
 
 read_freq_khz() {
-  # policy0 is usually representative; fallback to cpu0
   if [[ -r /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq ]]; then
     cat /sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq 2>/dev/null || true
     return
@@ -107,9 +114,7 @@ read_freq_khz() {
 }
 
 read_throttle_hex() {
-  # Pi-specific throttling flags (undervoltage, throttled, etc.)
   if command -v vcgencmd >/dev/null 2>&1; then
-    # throttled=0x50000
     vcgencmd get_throttled 2>/dev/null | awk -F'=' '{print $2}' || true
     return
   fi
@@ -120,7 +125,6 @@ start_load() {
   if command -v stress-ng >/dev/null 2>&1; then
     echo "Load generator: stress-ng (workers=$WORKERS)"
     if [[ "$DURATION" -gt 0 ]]; then
-      # --timeout ends stress-ng itself; we still log for DURATION below
       stress-ng --cpu "$WORKERS" --cpu-method matrixprod --verify --timeout "${DURATION}s" >/dev/null 2>&1 &
       LOAD_PID=$!
     else
@@ -136,10 +140,8 @@ start_load() {
     python3 - <<'PY' >/dev/null 2>&1 &
 import time
 x = 0
-# Tight integer loop; keeps a core busy.
 while True:
     x = (x + 1) & 0xFFFFFFFF
-    # prevent being optimized away in some runtimes
     if x == 0:
         time.sleep(0)
 PY
@@ -176,15 +178,18 @@ log_loop() {
 
 main() {
   echo "Cores/workers: $WORKERS"
+  echo "Mode: $([[ "$NOMINAL_ONLY" -eq 1 ]] && echo "nominal logging only" || echo "stress test")"
   echo "Duration: $([[ "$DURATION" -gt 0 ]] && echo "${DURATION}s" || echo "until Ctrl+C")"
 
-  if [[ "$SET_GOVERNOR" -eq 1 ]]; then
+  if [[ "$SET_GOVERNOR" -eq 1 && "$NOMINAL_ONLY" -eq 0 ]]; then
     set_governor_performance
   fi
 
-  start_load
+  if [[ "$NOMINAL_ONLY" -eq 0 ]]; then
+    start_load
+  fi
+
   log_loop
 }
 
 main
-
